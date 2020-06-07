@@ -1,0 +1,9 @@
+[awx]
+centos7     ansible_port=2222
+centos8     ansible_port=2223
+
+[awx:vars]
+ansible_host=127.0.0.1
+ansible_connection=ssh
+ansible_user=vagrant
+ansible_password=vagrant

@@ -1,0 +1,437 @@
+---
+- name: "AWX-RPM Setup"
+  hosts: all
+  become: True
+  become_user: root
+
+  tasks:
+
+    - name: Install Python3
+      yum:
+        name: python36
+        state: present
+      tags:
+        - python36
+
+    #####################################################################
+    # Prerequisites                                                     #
+    # https://awx.wiki/installation/section-one/subsection-two          #
+    # https://raw.githubusercontent.com/MrMEEE/awx-rpm/master/awx-setup #
+    #####################################################################
+    - name: Install SELinux prerequisites
+      block:
+        - name: Install SELinux policy core python utilities on {{ ansible_distribution }} 7
+          package:
+            name: policycoreutils-python
+            state: present
+          when: 
+            - ansible_os_family == "RedHat"
+            - ansible_distribution_major_version == "7"
+
+        - name: Install SELinux policy core python utilities on  {{ ansible_distribution }} 8
+          package:
+            name: policycoreutils-python-utils
+            state: present
+          when: 
+            - ansible_os_family == "RedHat"
+            - ansible_distribution_major_version == "8"
+
+
+        - name: Set required ports
+          seport:
+            ports: "{{ item }}"
+            proto: tcp
+            setype: http_port_t
+            state: present
+          loop:
+            - 8050
+            - 8051
+            - 8052
+
+        - name: Set httpd_can_network_connect flag on and keep it persistent across reboots
+          seboolean:
+            name: httpd_can_network_connect
+            state: yes
+            persistent: yes
+
+    - name: Configuring Firewall (Disabling for now/TODO)
+      service:
+        name: firewalld
+        state: stopped
+        enabled: no
+
+    #####################################################################
+    # Install Repositories for CentOS x86_64                            #
+    # https://awx.wiki/installation/repositories/centos-x86_64          #
+    # https://raw.githubusercontent.com/MrMEEE/awx-rpm/master/awx-setup #
+    #####################################################################
+    - name: Add repositories EPEL and SCL for CentOS 7
+      package:
+        name: 
+          - epel-release
+          - centos-release-scl-rh
+        state: present
+      when: 
+        - ansible_distribution == "CentOS"
+        - ansible_distribution_major_version == "7"
+
+    - name: Add EPEL to CentOS 8
+      package:
+        name: 
+          - epel-release
+          - scl-utils
+        state: present
+      when: 
+        - ansible_distribution == "CentOS"
+        - ansible_distribution_major_version == "8"
+
+    - name: Add EPEL to RHEL 7
+      yum:
+        name: https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm'
+        state: present
+      when: 
+        - ansible_distribution == "RedHat"
+        - ansible_distribution_major_version == "7"
+
+    - name: Add EPEL to RHEL 8
+      yum:
+        name: https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm'
+        state: present
+      when: 
+        - ansible_distribution == "RedHat"
+        - ansible_distribution_major_version == "8"
+
+    - name: Enabling RHEL 7 Repos
+      rhsm_repository:
+        name: 
+          - rhel-7-server-optional-rpms
+          - rhel-server-rhscl-7-rpms
+        state: enabled
+      when: 
+        - ansible_distribution == "RedHat"
+        - ansible_distribution_major_version == "7"
+
+    - name: Enabling RHEL 8 Repos
+      rhsm_repository:
+        name: rhel-8-for-x86_64-appstream-rpms
+        state: enabled
+      when: 
+        - ansible_distribution == "RedHat"
+        - ansible_distribution_major_version == "8"
+
+    #TODO: Enabling RHEL Repos
+    #   if not ostype == "CentOS":
+    #     print('Enabling RHEL Repos')
+    #     if int(osversion) == 7:
+    #       print(os.popen('subscription-manager repos --enable rhel-7-server-optional-rpms').read())
+    #       print(os.popen('subscription-manager repos --enable rhel-server-rhscl-7-rpms').read())
+    #     else:
+    #       print(os.popen('subscription-manager repos --enable  rhel-8-for-x86_64-appstream-rpms').read())
+
+    - name: Add AWX-RPM repository
+      yum_repository:
+        name: ansible-awx
+        description: Ansible AWX
+        baseurl: https://rpm.miracle.dk/AWX-RPM/CentOS_7
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AWX-RPM
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "7"
+
+    - name: Add AWX-RPM repository
+      #The module_hotfix option is required so the packages from the ansible-awx
+      #repository have higher precedence. Unfortunately the yum_repository 
+      #module does not support this option. Therefore, the repo file is created
+      #with the copy module
+      #
+      #This fixes an issue whereby the python3-docutils v0.16 would not install
+      #on CentOS 8
+      #https://github.com/MrMEEE/awx-build/issues/252
+      copy:
+        content: |
+          [ansible-awx]
+          baseurl = https://rpm.miracle.dk/AWX-RPM/CentOS_8
+          enabled = 1
+          gpgcheck = 1
+          gpgkey = file:///etc/pki/rpm-gpg/RPM-GPG-KEY-AWX-RPM
+          module_hotfixes=True
+          name = Ansible AWX
+        dest: /etc/yum.repos.d/ansible-awx.repo
+      when:
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "8"
+
+    - name: Download GPG key for AWX-RPM repository
+      get_url: 
+        url: https://rpm.miracle.dk/RPM-GPG-KEY-AWX-RPM
+        dest: /etc/pki/rpm-gpg/RPM-GPG-KEY-AWX-RPM
+        mode: '0644'
+
+    #####################################################################
+    # Installation                                                      # 
+    # https://awx.wiki/installation/installation                        #
+    # https://raw.githubusercontent.com/MrMEEE/awx-rpm/master/awx-setup #
+    #####################################################################
+
+    - name: Running Yum Update with Allow Erasing
+      #Fix an issue whereby packages from the ansible-awx cannot superseed
+      #the system packages even when their version number is lower
+      #https://github.com/MrMEEE/awx-build/issues/238
+      command: yum update -y -q --allowerasing
+      args:
+        warn: no
+        creates: /etc/tower/INSTALLED
+      when:
+       - ansible_os_family == "RedHat"
+       - ansible_distribution_major_version == "8"
+     
+    - name: Install Redis, Memcached and NGINX
+      yum:
+        name:
+          - redis
+          - memcached
+          - nginx
+        state: present
+
+    - name: Install PostgreSQL on {{ ansible_distribution }} 7
+      yum:
+        name: rh-postgresql10-postgresql-server
+        state: present
+      when: 
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "7"
+
+    - name: Install PostgreSQL on {{ ansible_distribution }} 8
+      yum:
+        name: postgresql-server
+        state: present
+      when: 
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "8"
+
+    - name: Install AWX
+      yum:
+        name: ansible-awx
+        state: present
+
+    #####################################################################
+    # Configuration                                                     #
+    # https://awx.wiki/installation/configuration                       #
+    # https://raw.githubusercontent.com/MrMEEE/awx-rpm/master/awx-setup #
+    #####################################################################
+    - name: Initialize DB on {{ ansible_distribution }} 7
+      shell: scl enable rh-postgresql10 "postgresql-setup initdb"
+      args:
+        creates: /var/opt/rh/rh-postgresql10/lib/pgsql/data/PG_VERSION
+      register: postgresql_initdb
+      when: 
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "7"
+
+    - name: Initialize DB on {{ ansible_distribution }} 8
+      command: postgresql-setup initdb
+      args:
+        creates: /var/lib/pgsql/data/PG_VERSION
+      register: postgresql_initdb_rh8
+      when: 
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "8"
+
+    - name: "Start services: Postgresql Database on {{ ansible_distribution }} 7"
+      service:
+        name: rh-postgresql10-postgresql
+        enabled: yes
+        state: started
+      when: 
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "7"
+
+    - name: "Start services: Postgresql Database on {{ ansible_distribution }} 8"
+      service:
+        name: postgresql
+        enabled: yes
+        state: started
+      when: 
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "8"
+
+    - name: Creating AWX postgreSQL user and Database on {{ ansible_distribution }} 7
+      become_user: postgres
+      shell: |
+        scl enable rh-postgresql10 "createuser -S awx"
+        scl enable rh-postgresql10 "createdb -O awx awx"
+      when: 
+        - postgresql_initdb.changed
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "7"
+      register: postgresql_createuser_db
+
+    - name: Creating AWX postgreSQL user on {{ ansible_distribution }} 8
+      become: yes
+      become_user: postgres
+      postgresql_user:
+        name: awx
+        role_attr_flags: SUPERUSER
+        state: present
+      when: 
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "8"
+      register: postgresql_createuser_db
+
+    - name: Creating AWX postgreSQL Database on {{ ansible_distribution }} 8
+      become: yes
+      become_user: postgres
+      postgresql_db:
+        name: awx
+        owner: awx
+        state: present
+      when: 
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "8"
+      register: postgresql_createuser_db
+
+    - name: Install password generation tool 'pwgen'
+      yum:
+        name: pwgen
+        state: present
+   
+    - name: Generate a random secret key for AWX
+      shell: pwgen 32 > /etc/tower/SECRET_KEY
+      args:
+        creates: /etc/tower/SECRET_KEY
+
+    - name: Initial database migration on {{ ansible_distribution }} 7
+      become_user: awx
+      shell: scl enable rh-postgresql10 "GIT_PYTHON_REFRESH=quiet awx-manage migrate"
+      when: 
+        - postgresql_initdb.changed
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "7"
+
+    - name: Initial database migration on {{ ansible_distribution }} 8
+      become_user: awx
+      shell: GIT_PYTHON_REFRESH=quiet awx-manage migrate
+      when: 
+        - postgresql_initdb_rh8.changed
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "8"
+
+    - name: Creating AWX admin user {{ ansible_distribution }} 7
+      become: yes
+      become_user: awx
+      shell: |
+        echo "from django.contrib.auth.models import User; User.objects.create_superuser('admin', 'root@localhost', 'password')" | scl enable rh-postgresql10 "GIT_PYTHON_REFRESH=quiet awx-manage shell"
+        scl enable rh-postgresql10 "GIT_PYTHON_REFRESH=quiet awx-manage create_preload_data" # Optional Sample Configuration
+        scl enable rh-postgresql10 "GIT_PYTHON_REFRESH=quiet awx-manage provision_instance --hostname=$(hostname)"
+        scl enable rh-postgresql10 "GIT_PYTHON_REFRESH=quiet awx-manage register_queue --queuename=tower --hostnames=$(hostname)"
+      when: 
+        - postgresql_initdb.changed
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "7"
+
+    - name: Creating AWX admin user on {{ ansible_distribution }} 8
+      become: yes
+      become_user: awx
+      shell: |
+        echo "from django.contrib.auth.models import User; User.objects.create_superuser('admin', 'root@localhost', 'password')" | GIT_PYTHON_REFRESH=quiet awx-manage shell
+        GIT_PYTHON_REFRESH=quiet awx-manage create_preload_data # Optional Sample Configuration
+        GIT_PYTHON_REFRESH=quiet awx-manage provision_instance --hostname=$(hostname)
+        GIT_PYTHON_REFRESH=quiet awx-manage register_queue --queuename=tower --hostnames=$(hostname)
+      when: 
+        - postgresql_initdb_rh8.changed
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "8"
+
+    - name: Installing NGINX Configuration
+      copy:
+        remote_src: yes
+        src: /usr/share/doc/ansible-awx/nginx.conf.example
+        dest: /etc/nginx/nginx.conf
+        backup: yes
+      notify: restart nginx
+
+    - name: Configuring Redis
+      blockinfile:
+        path: /etc/redis.conf
+        block: |
+          unixsocket /var/run/redis/redis.sock
+          unixsocketperm 770
+        insertafter: EOF
+        backup: yes
+
+    - name: Add awx user to group redis
+      user:
+        name: awx
+        group: awx
+        groups: redis
+        append: yes
+
+    - name: Creating initial AWX venv
+      command: awx-create-venv -f
+      args:
+        creates: /var/lib/awx/venv/ansible
+
+    - name: Install YUM 'versionlock' plugin
+      yum:
+        name: yum-plugin-versionlock
+        state: present
+
+    - name: Locking package versions for AWX-RPM and dependencies
+      #https://dnf-plugins-core.readthedocs.io/en/latest/versionlock.html
+      #dnf install 'dnf-command(versionlock)'
+      #dnf versionlock $(cat /usr/share/doc/ansible-awx/awx-locks.txt)
+      #dnf versionlock ansible-awx
+      shell: |
+        yum versionlock $(cat /usr/share/doc/ansible-awx/awx-locks.txt)
+        yum versionlock ansible-awx
+
+    - name: Starting and enabling AWX-RPM Services
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - awx
+        - nginx
+        - memcached
+        - redis
+
+    - name: Link virtualenv-3 (Only on {{ ansible_distribution }} 7)
+      file:
+        src: /usr/bin/virtualenv-3
+        dest: /usr/bin/virtualenv
+        state: link
+      when: 
+        - postgresql_initdb.changed
+        - ansible_os_family == "RedHat"
+        - ansible_distribution_major_version == "7"
+
+    - name: Installation finished!
+      file:
+        path: /etc/tower/INSTALLED
+        state: touch
+        modification_time: preserve
+        access_time: preserve
+
+    - debug:
+        msg: |
+          "Congratulations, AWX-RPM is now installed, and hopefully running on http://{{ ansible_hostname }}
+          Login:
+            user: admin
+            password: password (remember to change)
+
+          Please report any issues at: https://github.com/MrMEEE/awx-build/issues
+
+          awx-create-env can be used for creating virtual ansible python environments (VENVs)..
+
+          awx-setup can be used for updating and managing VENVs..
+
+          Have fun!!!"
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
